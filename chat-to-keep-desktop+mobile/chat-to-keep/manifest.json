@@ -1,0 +1,14 @@
+﻿{
+  "manifest_version": 3,
+  "name": "Chat to Keep",
+  "version": "1.0",
+  "description": "Save chat as Markdown link to clipboard",
+  "permissions": ["activeTab", "scripting", "storage"],
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": "icon128.png"
+  },
+  "icons": {
+    "128": "icon128.png"
+  }
+}
