@@ -1,173 +1,208 @@
-﻿var tokenInput = document.getElementById('token');
-var saveBtn = document.getElementById('saveBtn');
-var keepBtn = document.getElementById('keepBtn');
-var linkBox = document.getElementById('linkBox');
-var statusEl = document.getElementById('status');
-
-chrome.storage.local.get('ghToken', function(data) {
-  if (data.ghToken) tokenInput.value = data.ghToken;
-});
-
-saveBtn.addEventListener('click', async function() {
-  var token = tokenInput.value.trim();
-  if (!token) {
-    showStatus('Введите GitHub Token', false);
-    return;
+// Selectors for different sites
+const SITE_SELECTORS = {
+  'routerai': {
+    messageSelector: '.routerai-chat-message',
+    userClass: 'routerai-chat-message--user',
+    assistantClass: 'routerai-chat-message--assistant',
+    textSelector: '.routerai-chat-markdown, .routerai-chat-message__text, .routerai-chat-message__content'
+  },
+  'deepseek': {
+    // These are guesses – adjust if needed after inspecting the page
+    messageSelector: '.chat-message, .message, [class*="message-item"]',
+    userClass: 'user',                // class that marks user messages
+    assistantClass: 'assistant',      // class that marks assistant messages
+    textSelector: '.markdown, .message-content, .text, .whitespace-pre-wrap'
   }
+};
 
-  chrome.storage.local.set({ ghToken: token });
-  saveBtn.disabled = true;
-  saveBtn.textContent = '⏳ Прокрутка и сбор...';
-  keepBtn.style.display = 'none';
-  linkBox.style.display = 'none';
-  statusEl.textContent = '';
+// Detect which site we are on
+function getSiteConfig(url) {
+  if (url.includes('routerai')) return SITE_SELECTORS.routerai;
+  if (url.includes('deepseek')) return SITE_SELECTORS.deepseek;
+  return null; // unsupported site
+}
 
-  try {
-    var tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-    var tab = tabs[0];
+document.addEventListener('DOMContentLoaded', () => {
+  const tokenInput = document.getElementById('token');
+  const saveBtn = document.getElementById('saveBtn');
+  const keepBtn = document.getElementById('keepBtn');
+  const linkBox = document.getElementById('linkBox');
+  const statusEl = document.getElementById('status');
 
-    var results = await chrome.scripting.executeScript({
-      target: { tabId: tab.id },
-      func: async function() {
-        var collected = [];
-        var seenKeys = new Set();
+  chrome.storage.local.get('ghToken', data => {
+    if (data.ghToken) tokenInput.value = data.ghToken;
+  });
 
-        function grab() {
-          var msgs = document.querySelectorAll('.routerai-chat-message');
-          msgs.forEach(function(msg) {
-            var isUser = msg.classList.contains('routerai-chat-message--user');
-            var isAssistant = msg.classList.contains('routerai-chat-message--assistant');
-            if (!isUser && !isAssistant) return;
+  saveBtn.addEventListener('click', async () => {
+    const token = tokenInput.value.trim();
+    if (!token) {
+      showStatus('Введите GitHub Token', false);
+      return;
+    }
 
-            var role = isUser ? 'user' : 'assistant';
-            var textEl = msg.querySelector('.routerai-chat-markdown')
-              || msg.querySelector('.routerai-chat-message__text')
-              || msg.querySelector('.routerai-chat-message__content');
-            if (!textEl) return;
+    chrome.storage.local.set({ ghToken: token });
+    saveBtn.disabled = true;
+    saveBtn.textContent = '⏳ Прокрутка и сбор...';
+    keepBtn.style.display = 'none';
+    linkBox.style.display = 'none';
+    statusEl.textContent = '';
 
-            var text = textEl.innerText.trim();
-            if (text.length < 2) return;
+    try {
+      const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
+      const tab = tabs[0];
 
-            var key = role + ':' + text.substring(0, 80);
-            if (seenKeys.has(key)) return;
-            seenKeys.add(key);
+      // Inject a script that will extract messages using the right selectors
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: async (siteConfig) => {
+          // Helper: wait a bit
+          const delay = ms => new Promise(r => setTimeout(r, ms));
 
-            collected.push({ role: role, text: text });
-          });
-        }
+          const collected = [];
+          const seenKeys = new Set();
 
-        // Найти скролл-контейнер
-        var container = null;
-        var msg = document.querySelector('.routerai-chat-message');
-        if (msg) {
-          var el = msg.parentElement;
-          while (el && el !== document.body) {
-            var s = window.getComputedStyle(el);
-            if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 50) {
-              container = el;
+          function grab() {
+            const messages = document.querySelectorAll(siteConfig.messageSelector);
+            for (const msg of messages) {
+              // Determine role by class presence
+              let role = null;
+              if (msg.classList.contains(siteConfig.userClass)) role = 'user';
+              else if (msg.classList.contains(siteConfig.assistantClass)) role = 'assistant';
+
+              // Fallback: check data-role or any class containing 'user'/'assistant'
+              if (!role) {
+                if (msg.getAttribute('data-role') === 'user') role = 'user';
+                else if (msg.getAttribute('data-role') === 'assistant') role = 'assistant';
+                else {
+                  const classNames = msg.className;
+                  if (classNames.includes('user')) role = 'user';
+                  else if (classNames.includes('assistant')) role = 'assistant';
+                }
+              }
+              if (!role) continue;
+
+              // Find text container
+              let textEl = msg.querySelector(siteConfig.textSelector);
+              if (!textEl) {
+                // fallback: any div/p inside that might contain the text
+                textEl = msg.querySelector('div:not(:empty), p:not(:empty)');
+              }
+              if (!textEl) continue;
+
+              const text = textEl.innerText.trim();
+              if (text.length < 2) continue;
+
+              const key = `${role}:${text.substring(0, 80)}`;
+              if (seenKeys.has(key)) continue;
+              seenKeys.add(key);
+
+              collected.push({ role, text });
+            }
+          }
+
+          // Find scroll container
+          let container = null;
+          const firstMsg = document.querySelector(siteConfig.messageSelector);
+          if (firstMsg) {
+            let el = firstMsg.parentElement;
+            while (el && el !== document.body) {
+              const s = window.getComputedStyle(el);
+              if ((s.overflowY === 'auto' || s.overflowY === 'scroll') && el.scrollHeight > el.clientHeight + 50) {
+                container = el;
+                break;
+              }
+              el = el.parentElement;
+            }
+          }
+          if (!container) container = document.documentElement;
+
+          // Scroll up
+          container.scrollTop = 0;
+          await delay(1000);
+          grab();
+
+          // Scroll down step by step
+          const step = container.clientHeight * 0.4;
+          for (let i = 0; i < 500; i++) {
+            container.scrollTop += step;
+            await delay(300);
+            grab();
+            if (container.scrollTop + container.clientHeight >= container.scrollHeight - 10) {
+              await delay(500);
+              grab();
               break;
             }
-            el = el.parentElement;
           }
-        }
-        if (!container) container = document.documentElement;
 
-        // Вверх
-        container.scrollTop = 0;
-        await new Promise(function(r) { setTimeout(r, 1000); });
-        grab();
+          // Build Markdown
+          let md = '';
+          collected.forEach((m, idx) => {
+            if (m.role === 'user') {
+              md += '## 🧑 Вопрос\n\n' + m.text + '\n\n';
+            } else {
+              md += '## 🤖 Ответ\n\n' + m.text + '\n\n';
+            }
+            if (idx < collected.length - 1) md += '---\n\n';
+          });
 
-        // Вниз по шагам
-        var step = container.clientHeight * 0.4;
-        for (var i = 0; i < 500; i++) {
-          container.scrollTop += step;
-          await new Promise(function(r) { setTimeout(r, 300); });
-          grab();
-          if (container.scrollTop + container.clientHeight >= container.scrollHeight - 10) {
-            await new Promise(function(r) { setTimeout(r, 500); });
-            grab();
-            break;
-          }
-        }
+          console.log(`Extracted ${collected.length} messages for ${window.location.hostname}`);
+          return { markdown: md, count: collected.length };
+        },
+        args: [getSiteConfig(tab.url)]
+      });
 
-        // Формируем Markdown
-        var md = '';
-        collected.forEach(function(m, i) {
-          if (m.role === 'user') {
-            md += '## 🧑 Вопрос\n\n' + m.text + '\n\n';
-          } else {
-            md += '## 🤖 Ответ\n\n' + m.text + '\n\n';
-          }
-          if (i < collected.length - 1) {
-            md += '---\n\n';
-          }
-        });
-
-        return { markdown: md, count: collected.length };
+      const data = results[0].result;
+      if (!data || !data.markdown || data.markdown.trim().length < 20) {
+        throw new Error('Не удалось извлечь сообщения (проверьте селекторы на этой странице)');
       }
-    });
 
-    var data = results[0].result;
+      const now = new Date();
+      const filename = `chat_${now.toISOString().slice(0, 10)}.md`;
+      const gistBody = {
+        description: `DeepSeek Chat — ${now.toISOString().slice(0, 10)} (${data.count} messages)`,
+        public: false,
+        files: { [filename]: { content: data.markdown } }
+      };
 
-    if (!data || !data.markdown || data.markdown.trim().length < 20) {
-      throw new Error('Не удалось извлечь сообщения');
+      const resp = await fetch('https://api.github.com/gists', {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(gistBody)
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json();
+        throw new Error(err.message || resp.statusText);
+      }
+
+      const gist = await resp.json();
+      const gistUrl = gist.html_url;
+      await navigator.clipboard.writeText(gistUrl);
+
+      linkBox.textContent = gistUrl;
+      linkBox.style.display = 'block';
+      keepBtn.style.display = 'block';
+      showStatus(`✅ ${data.count} сообщений сохранено! Ссылка скопирована.`, true);
+
+    } catch (err) {
+      showStatus(`❌ ${err.message}`, false);
+    } finally {
+      saveBtn.disabled = false;
+      saveBtn.textContent = '📋 Сохранить чат в Gist';
     }
+  });
 
-    var now = new Date();
-    var d = now.toISOString().slice(0, 10);
-    var filename = 'chat_' + d + '.md';
+  keepBtn.addEventListener('click', () => {
+    chrome.tabs.create({ url: 'https://keep.google.com' });
+  });
 
-    var body = {
-      description: 'RouterAI Chat — ' + d + ' (' + data.count + ' messages)',
-      public: false,
-      files: {}
-    };
-    body.files[filename] = { content: data.markdown };
-
-    var resp = await fetch('https://api.github.com/gists', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + token,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify(body)
-    });
-
-    if (!resp.ok) {
-      var errData = await resp.json();
-      throw new Error(errData.message || resp.statusText);
-    }
-
-    var gist = await resp.json();
-    var gistUrl = gist.html_url;
-
-    await navigator.clipboard.writeText(gistUrl);
-
-    linkBox.textContent = gistUrl;
-    linkBox.style.display = 'block';
-    keepBtn.style.display = 'block';
-    showStatus('✅ ' + data.count + ' сообщений сохранено! Ссылка скопирована.', true);
-
-  } catch(err) {
-    showStatus('❌ ' + err.message, false);
-  } finally {
-    saveBtn.disabled = false;
-    saveBtn.textContent = '📋 Сохранить чат в Gist';
+  function showStatus(msg, ok) {
+    statusEl.textContent = msg;
+    statusEl.style.display = 'block';
+    statusEl.style.background = ok ? '#e6f4ea' : '#fce8e6';
+    statusEl.style.color = ok ? '#1e7e34' : '#c62828';
   }
 });
-
-keepBtn.addEventListener('click', function() {
-  chrome.tabs.create({ url: 'https://keep.google.com' });
-});
-
-function showStatus(msg, ok) {
-  statusEl.textContent = msg;
-  statusEl.style.display = 'block';
-  if (ok) {
-    statusEl.style.background = '#e6f4ea';
-    statusEl.style.color = '#1e7e34';
-  } else {
-    statusEl.style.background = '#fce8e6';
-    statusEl.style.color = '#c62828';
-  }
-}
